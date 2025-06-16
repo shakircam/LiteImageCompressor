@@ -10,11 +10,11 @@ import androidx.work.workDataOf
 import com.image.compressor.worker.ImageCompressWorker
 import java.util.UUID
 import android.graphics.Bitmap
+import com.image.compressor.utils.getFileSizeKB
 import java.io.File
 
- class ImageCompressor private constructor(
+class ImageCompressor private constructor(
     private val context: Context,
-    private val uri: Uri,
     private val maxSizeMB: Double,
     private val compressionQuality: Int?,
     private val maxWidth: Int?,
@@ -27,7 +27,8 @@ import java.io.File
     private val enableLogging: Boolean
 ) {
 
-    class Builder(private val context: Context, private val uri: Uri) {
+    class Builder(private val context: Context) {
+
         // ✅ Optional: Target size in MB (default = 1.0 MB)
         private var maxSizeMB: Double = 1.0
 
@@ -79,7 +80,6 @@ import java.io.File
         fun build(): ImageCompressor {
             return ImageCompressor(
                 context,
-                uri,
                 maxSizeMB,
                 compressionQuality,
                 maxWidth,
@@ -94,28 +94,76 @@ import java.io.File
         }
     }
 
-    fun compress(): UUID {
+    fun compress(uri: Uri, onStart: ((UUID) -> Unit)? = null): UUID {
+        val workManager = WorkManager.getInstance(context)
+        val outputPath = outputDir?.absolutePath ?: context.cacheDir.absolutePath
+        // Get original file size
+        val originalSizeKB = getFileSizeKB(context,uri)
+
         val inputData = workDataOf(
             "uri" to uri.toString(),
             "maxSizeMB" to maxSizeMB,
-            "compressionQuality" to (compressionQuality ?: -1), // -1 means auto
+            "compressionQuality" to (compressionQuality ?: -1),
             "maxWidth" to (maxWidth ?: -1),
             "maxHeight" to (maxHeight ?: -1),
             "compressFormat" to (compressFormat?.name ?: ""),
-            "outputFileName" to (outputFileName ?: ""),
+            "outputFileName" to outputFileName,
+            "outputDir" to outputPath,
+            "enableLogging" to enableLogging,
+            "originalSizeKB" to originalSizeKB
+        )
+
+        val request = OneTimeWorkRequestBuilder<ImageCompressWorker>()
+            .setInputData(inputData)
+            .setConstraints(constraints)
+            .apply { tag?.let { addTag(it) } }
+            .build()
+
+        workManager.enqueue(request)
+        onStart?.invoke(request.id)
+        return request.id
+    }
+
+    fun compress(uris: List<Uri>, onStart: ((index: Int, uuid: UUID) -> Unit)? = null): UUID {
+        val workManager = WorkManager.getInstance(context)
+        val outputPath = outputDir?.absolutePath ?: context.cacheDir.absolutePath
+
+        // Convert URIs to comma-separated string
+        val uriListString = uris.joinToString(",") { it.toString() }
+
+        val inputData = workDataOf(
+            "uriList" to uriListString,
+            "maxSizeMB" to maxSizeMB,
+            "compressionQuality" to (compressionQuality ?: -1),
+            "maxWidth" to (maxWidth ?: -1),
+            "maxHeight" to (maxHeight ?: -1),
+            "compressFormat" to (compressFormat?.name ?: ""),
+            "outputFileName" to outputFileName,
+            "outputDir" to outputPath,
             "enableLogging" to enableLogging
         )
 
-        val requestBuilder = OneTimeWorkRequestBuilder<ImageCompressWorker>()
+        val request = OneTimeWorkRequestBuilder<ImageCompressWorker>()
             .setInputData(inputData)
             .setConstraints(constraints)
+            .apply { tag?.let { addTag(it) } }
+            .build()
 
-        tag?.let { requestBuilder.addTag(it) }
-
-        val request = requestBuilder.build()
-
-        WorkManager.getInstance(context).enqueue(request)
-
+        workManager.enqueue(request)
+        onStart?.invoke(0, request.id) // For batch, we return single work ID
         return request.id
     }
+
+    companion object {
+        // Helper to cancel compression by tag
+        fun cancelByTag(context: Context, tag: String) {
+            WorkManager.getInstance(context).cancelAllWorkByTag(tag)
+        }
+
+        // Helper to cancel specific work IDs
+        fun cancelByIds(context: Context, id: UUID) {
+            WorkManager.getInstance(context).cancelWorkById(id)
+        }
+    }
+
 }

@@ -16,6 +16,9 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.math.sqrt
+import androidx.core.net.toUri
+import com.image.compressor.utils.getFileSizeKB
+import kotlinx.coroutines.yield
 
 class ImageCompressWorker(
     context: Context,
@@ -26,8 +29,182 @@ class ImageCompressWorker(
     private val appContext = context
 
     override suspend fun doWork(): Result {
-        try {
-            val uriString = inputData.getString("uri") ?: return Result.failure()
+        return try {
+            val uriString = inputData.getString("uri")
+            val uriListString = inputData.getString("uriList")
+
+            if (!uriListString.isNullOrEmpty()) {
+                processMultipleImages(uriListString.split(","))
+            } else if (!uriString.isNullOrEmpty()) {
+                processSingleImage(uriString)
+            } else {
+                Result.failure(workDataOf("error" to "No URIs provided"))
+            }
+
+        } catch (e: Exception) {
+            Result.failure(workDataOf("error" to e.message))
+        }
+    }
+
+    private suspend fun processSingleImage(uriString: String): Result {
+        val uri = uriString.toUri()
+        val enableLogging = inputData.getBoolean("enableLogging", false)
+
+        if (enableLogging) Log.d(TAG, "Processing single image: $uri")
+
+        // Get original file size for compression ratio calculation
+        val originalSizeKB = getFileSizeKB(appContext,uri)
+
+        // Compress the image
+        val compressionResult = compressImage(uri, 0, 1)
+
+        return if (compressionResult.success) {
+            Result.success(
+                workDataOf(
+                    "compressedImagePath" to compressionResult.outputPath,
+                    "originalSizeKB" to originalSizeKB,
+                    "compressedSizeKB" to compressionResult.compressedSizeKB,
+                    "compressionRatio" to calculateCompressionRatio(originalSizeKB, compressionResult.compressedSizeKB)
+                )
+            )
+        } else {
+            Result.failure(workDataOf("error" to compressionResult.error))
+        }
+    }
+
+    private suspend fun processMultipleImages(uriList: List<String>): Result {
+        val enableLogging = inputData.getBoolean("enableLogging", false)
+        val totalImages = uriList.size
+
+        if (enableLogging) Log.d(TAG, "Processing $totalImages images")
+
+        val results = mutableListOf<WorkerCompressionResult>()
+        val compressedPaths = mutableListOf<String>()
+        var successCount = 0
+        var failedCount = 0
+
+        setProgress(workDataOf(
+            "progress" to 0,
+            "currentImage" to 0,
+            "totalImages" to totalImages,
+            "status" to "Starting batch compression..."
+        ))
+
+        uriList.forEachIndexed { index, uriString ->
+            try {
+                val uri = uriString.toUri()
+                val currentImageProgress = ((index.toFloat() / totalImages) * 100).toInt()
+
+                setProgress(workDataOf(
+                    "progress" to currentImageProgress,
+                    "currentImage" to index + 1,
+                    "totalImages" to totalImages,
+                    "status" to "Processing image ${index + 1} of $totalImages..."
+                ))
+
+                if (enableLogging) Log.d(TAG, "Processing image ${index + 1}/$totalImages: $uri")
+
+                // Get original file size
+                val originalSizeKB = getFileSizeKB(appContext,uri)
+
+                // Compress the image
+                val compressionResult = compressImage(uri, index, totalImages)
+
+                if (compressionResult.success) {
+                    results.add(
+                        WorkerCompressionResult(
+                            index = index,
+                            originalUri = uriString,
+                            outputPath = compressionResult.outputPath,
+                            originalSizeKB = originalSizeKB,
+                            compressedSizeKB = compressionResult.compressedSizeKB,
+                            compressionRatio = calculateCompressionRatio(originalSizeKB, compressionResult.compressedSizeKB),
+                            success = true,
+                            error = null
+                        )
+                    )
+                    compressionResult.outputPath?.let { compressedPaths.add(it) }
+                    successCount++
+                } else {
+                    results.add(
+                        WorkerCompressionResult(
+                            index = index,
+                            originalUri = uriString,
+                            outputPath = null,
+                            originalSizeKB = originalSizeKB,
+                            compressedSizeKB = 0,
+                            compressionRatio = 0f,
+                            success = false,
+                            error = compressionResult.error
+                        )
+                    )
+                    failedCount++
+                    if (enableLogging) Log.e(TAG, "Failed to compress image ${index + 1}: ${compressionResult.error}")
+                }
+
+                // Yield to allow cancellation
+                yield()
+
+            } catch (e: Exception) {
+                results.add(
+                    WorkerCompressionResult(
+                        index = index,
+                        originalUri = uriString,
+                        outputPath = null,
+                        originalSizeKB = 0,
+                        compressedSizeKB = 0,
+                        compressionRatio = 0f,
+                        success = false,
+                        error = e.message ?: "Unknown error"
+                    )
+                )
+                failedCount++
+                if (enableLogging) Log.e(TAG, "Exception processing image ${index + 1}: ${e.message}", e)
+            }
+        }
+
+        setProgress(workDataOf(
+            "progress" to 100,
+            "currentImage" to totalImages,
+            "totalImages" to totalImages,
+            "status" to "Batch compression completed: $successCount successful, $failedCount failed"
+        ))
+
+        if (enableLogging) {
+            Log.d(TAG, "Batch compression completed: $successCount successful, $failedCount failed")
+        }
+
+        val resultsJson = mapResultsToJson(results)
+
+        return Result.success(
+            workDataOf(
+                "compressedImagePaths" to compressedPaths.toTypedArray(),
+                "results" to resultsJson.toString(),
+                "successCount" to successCount,
+                "failedCount" to failedCount,
+                "totalProcessed" to totalImages
+            )
+        )
+    }
+
+    // Convert results to JSON string for output
+    private fun mapResultsToJson(results: List<WorkerCompressionResult>): List<Map<String, Any?>> {
+        return results.map { result ->
+            mapOf(
+                "index" to result.index,
+                "originalUri" to result.originalUri,
+                "outputPath" to result.outputPath,
+                "originalSizeKB" to result.originalSizeKB,
+                "compressedSizeKB" to result.compressedSizeKB,
+                "compressionRatio" to result.compressionRatio,
+                "success" to result.success,
+                "error" to result.error
+            )
+        }
+    }
+
+    private suspend fun compressImage(uri: Uri, index: Int, totalImages: Int): ImageCompressionResult {
+        return try {
             val maxSizeMB = inputData.getDouble("maxSizeMB", 1.0)
             val compressionQuality = inputData.getInt("compressionQuality", -1)
             val maxWidth = inputData.getInt("maxWidth", -1)
@@ -35,9 +212,6 @@ class ImageCompressWorker(
             val compressFormatName = inputData.getString("compressFormat").orEmpty()
             val outputFileName = inputData.getString("outputFileName").takeIf { it?.isNotBlank() == true }
             val enableLogging = inputData.getBoolean("enableLogging", false)
-
-            val uri = Uri.parse(uriString)
-            if (enableLogging) Log.d(TAG, "Compression start uri: $uri")
 
             // Determine compress format
             val compressFormat = parseCompressFormat(compressFormatName)
@@ -58,6 +232,7 @@ class ImageCompressWorker(
             val outputStream = ByteArrayOutputStream()
             targetBitmap.compress(compressFormat, quality, outputStream)
 
+            // Clean up bitmaps
             bitmap.recycle()
             if (targetBitmap != bitmap) {
                 targetBitmap.recycle()
@@ -65,24 +240,46 @@ class ImageCompressWorker(
 
             val compressedBytes = outputStream.toByteArray()
 
-            // Save compressed bytes to file
-            val fileName =
-                outputFileName ?: ("compressed_${System.currentTimeMillis()}." + getFileExtension(
-                    compressFormat
-                ))
+            // Generate unique filename for multiple images
+            val fileName = if (totalImages > 1) {
+                outputFileName?.let { "${it}_${index}_${System.currentTimeMillis()}.${getFileExtension(compressFormat)}" }
+                    ?: "compressed_${index}_${System.currentTimeMillis()}.${getFileExtension(compressFormat)}"
+            } else {
+                outputFileName?.let { "${it}_${System.currentTimeMillis()}.${getFileExtension(compressFormat)}" }
+                    ?: "compressed_${System.currentTimeMillis()}.${getFileExtension(compressFormat)}"
+            }
+
             val outputFile = File(appContext.cacheDir, fileName)
             outputFile.writeBytes(compressedBytes)
 
             if (enableLogging) {
-                Log.d(TAG, "Compression done, saved to ${outputFile.absolutePath}")
+                Log.d(TAG, "Image ${index + 1}/$totalImages compressed successfully")
+                Log.d(TAG, "Saved to: ${outputFile.absolutePath}")
                 Log.d(TAG, "Final size: ${compressedBytes.size / 1024} KB, quality: $quality")
             }
 
-            return Result.success(workDataOf("compressedImagePath" to outputFile.absolutePath))
+            ImageCompressionResult(
+                success = true,
+                outputPath = outputFile.absolutePath,
+                compressedSizeKB = compressedBytes.size / 1024,
+                error = null
+            )
+
         } catch (e: Exception) {
-            Log.e(TAG, "Compression failed: ${e.message}", e)
-            return Result.failure()
+            Log.e(TAG, "Compression failed for image ${index + 1}/$totalImages: ${e.message}", e)
+            ImageCompressionResult(
+                success = false,
+                outputPath = null,
+                compressedSizeKB = 0,
+                error = e.message ?: "Unknown compression error"
+            )
         }
+    }
+
+    private fun calculateCompressionRatio(originalKB: Long, compressedKB: Int): Float {
+        return if (originalKB > 0) {
+            ((originalKB - compressedKB).toFloat() / originalKB.toFloat()) * 100
+        } else 0f
     }
 
     private fun parseCompressFormat(formatName: String): Bitmap.CompressFormat {
@@ -269,6 +466,24 @@ class ImageCompressWorker(
             }
         }
     }
+
+    private data class ImageCompressionResult(
+        val success: Boolean,
+        val outputPath: String?,
+        val compressedSizeKB: Int,
+        val error: String?
+    )
+
+    private data class WorkerCompressionResult(
+        val index: Int,
+        val originalUri: String,
+        val outputPath: String?,
+        val originalSizeKB: Long,
+        val compressedSizeKB: Int,
+        val compressionRatio: Float,
+        val success: Boolean,
+        val error: String?
+    )
 }
 
 

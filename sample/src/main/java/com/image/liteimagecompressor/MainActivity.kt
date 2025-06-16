@@ -11,15 +11,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -27,15 +32,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.work.WorkManager
 import coil.compose.rememberAsyncImagePainter
 import com.image.compressor.ImageCompressor
+import com.image.compressor.utils.getFileSizeMB
+import com.image.compressor.utils.getImageInfo
+import com.image.compressor.utils.getImageInfoFromFile
 import com.image.liteimagecompressor.ui.theme.LiteImageCompressorTheme
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.InputStream
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,105 +63,178 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ImageCompressorUI() {
     val context = LocalContext.current
-    val selectedUri = remember { mutableStateOf<Uri?>(null) }
-    val originalSizeMB = remember { mutableStateOf<Double?>(null) }
-    val compressedBytes = remember { mutableStateOf<ByteArray?>(null) }
-    val compressedSizeMB = remember { mutableStateOf<Double?>(null) }
     val coroutineScope = rememberCoroutineScope()
 
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent(),
-        onResult = { uri ->
-            selectedUri.value = uri
-            compressedBytes.value = null
-            compressedSizeMB.value = null
-            uri?.let {
-                val inputStream: InputStream? = context.contentResolver.openInputStream(it)
-                val size = inputStream?.available()?.toDouble() ?: 0.0
-                originalSizeMB.value = size / (1024 * 1024)
-                inputStream?.close()
-            }
+    val singleUri = remember { mutableStateOf<Uri?>(null) }
+    val multipleUris = remember { mutableStateOf<List<Uri>>(emptyList()) }
+    val compressedResults = remember { mutableStateMapOf<Uri, Pair<ByteArray, Triple<Int, Int, String>>>() }
+    val originalInfoMap = remember { mutableStateMapOf<Uri, Triple<Int, Int, String>>() }
+    val originalSizeMap = remember { mutableStateMapOf<Uri, Double>() }
+
+    val singlePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            singleUri.value = it
+            multipleUris.value = listOf(it)
+            compressedResults.clear()
+            originalInfoMap[it] = getImageInfo(context, it)
+            originalSizeMap[it] = getFileSizeMB(context, it)
         }
-    )
+    }
+
+    val multiPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        multipleUris.value = uris
+        compressedResults.clear()
+        uris.forEach { uri ->
+            originalInfoMap[uri] = getImageInfo(context, uri)
+            originalSizeMap[uri] = getFileSizeMB(context, uri)
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState())
     ) {
-        Button(onClick = { imagePickerLauncher.launch("image/*") }) {
-            Text("Pick Image")
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(onClick = { singlePicker.launch("image/*") }) {
+                Text("Pick Single Image")
+            }
+            Button(onClick = { multiPicker.launch("image/*") }) {
+                Text("Pick Multiple Images")
+            }
         }
 
-        selectedUri.value?.let { uri ->
-            Image(
-                painter = rememberAsyncImagePainter(uri),
-                contentDescription = "Original Image",
-                modifier = Modifier
-                    .height(200.dp)
-                    .fillMaxWidth()
-            )
+        Spacer(modifier = Modifier.height(16.dp))
 
-            Text(
-                text = "Original Size: ${"%.2f".format(originalSizeMB.value ?: 0.0)} MB",
-                style = MaterialTheme.typography.bodyMedium,
-                textAlign = TextAlign.Center
-            )
+        multipleUris.value.forEach { uri ->
+            ImageCompareCard(
+                uri = uri,
+                originalInfo = originalInfoMap[uri],
+                originalSizeMB = originalSizeMap[uri],
+                compressedResult = compressedResults[uri],
+                onCompress = {
+                    val workId = ImageCompressor.Builder(context)
+                        .setMaxSizeMB(1.0)
+                        .setMaxWidth(1280)
+                        .setMaxHeight(720)
+                        .setCompressFormat(Bitmap.CompressFormat.WEBP)
+                        .setCompressionQuality(80)
+                        .setOutputFileName("compressed_avatar")
+                        .setEnableLogging(true)
+                        .build()
+                        .compress(uri)
 
-            Button(onClick = {
-                val workId = ImageCompressor.Builder(context, uri)
-                    .setMaxSizeMB(1.0)                             // Max target size in MB
-                    .setMaxWidth(1280)                             // Optional: Max width
-                    .setMaxHeight(720)                             // Optional: Max height
-                    .setCompressFormat(Bitmap.CompressFormat.WEBP) // Optional: Format
-                    .setCompressionQuality(80)                     // Optional: JPEG/WebP quality
-                    .setOutputFileName("compressed_avatar")        // Optional: Desired file name
-                    .setEnableLogging(true)                        // Optional: Enable logs
-                    .setTag("image-compression")                   // Optional: WorkManager tag
-                    .build()
-                    .compress()
-
-                // Observe result from WorkManager
-                coroutineScope.launch {
-                    val workManager = WorkManager.getInstance(context)
-                    workManager.getWorkInfoByIdLiveData(workId).observeForever { info ->
-                        if (info != null && info.state.isFinished && info.outputData.keyValueMap.isNotEmpty()) {
-                            val compressedImagePath = info.outputData.getString("compressedImagePath")
-                            compressedImagePath?.let { path ->
-                                val file = File(path)
-                                if (file.exists()) {
-                                    // Read bytes if you want or just use the file path to display image
-                                    val bytes = file.readBytes()
-                                    compressedBytes.value = bytes
-                                    compressedSizeMB.value = bytes.size.toDouble() / (1024 * 1024)
+                    coroutineScope.launch {
+                        val workManager = WorkManager.getInstance(context)
+                        workManager.getWorkInfoByIdLiveData(workId).observeForever { info ->
+                            if (info != null && info.state.isFinished) {
+                                val outputPath = info.outputData.getString("compressedImagePath")
+                                outputPath?.let { path ->
+                                    val file = File(path)
+                                    if (file.exists()) {
+                                        val bytes = file.readBytes()
+                                        val info = getImageInfoFromFile(path)
+                                        compressedResults[uri] = bytes to info
+                                    }
                                 }
                             }
                         }
                     }
-
                 }
-            }) {
-                Text("Compress Image")
-            }
-        }
-
-        compressedBytes.value?.let { bytes ->
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = "Compressed Image",
-                modifier = Modifier
-                    .height(200.dp)
-                    .fillMaxWidth()
             )
 
-            Text(
-                text = "Compressed Size: ${"%.2f".format(compressedSizeMB.value ?: 0.0)} MB",
-                style = MaterialTheme.typography.bodyMedium,
-                textAlign = TextAlign.Center
-            )
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
+
+
+@Composable
+fun ImageCompareCard(
+    uri: Uri,
+    originalInfo: Triple<Int, Int, String>?,
+    originalSizeMB: Double?,
+    compressedResult: Pair<ByteArray, Triple<Int, Int, String>>?,
+    onCompress: () -> Unit
+) {
+    Column {
+        Text("Comparing: ${uri.lastPathSegment}", fontWeight = FontWeight.Bold)
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(200.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Image(
+                painter = rememberAsyncImagePainter(uri),
+                contentDescription = "Original",
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 4.dp)
+            )
+            compressedResult?.first?.let { bytes ->
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "Compressed",
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 4.dp)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            ImageDetailColumn("Original", originalSizeMB, originalInfo)
+            ImageDetailColumn(
+                "Compressed",
+                compressedResult?.first?.size?.toDouble()?.div(1024 * 1024),
+                compressedResult?.second,
+                ratio = if (compressedResult != null && originalSizeMB != null) {
+                    (originalSizeMB / (compressedResult.first.size.toDouble() / (1024 * 1024)))
+                } else null
+            )
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Button(onClick = onCompress) {
+            Text("Compress This Image")
+        }
+    }
+}
+
+
+@Composable
+fun ImageDetailColumn(
+    label: String,
+    sizeMB: Double?,
+    info: Triple<Int, Int, String>?,
+    ratio: Double? = null
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, fontWeight = FontWeight.Bold)
+        Text("Size: %.2f MB".format(sizeMB ?: 0.0))
+        info?.let { (w, h, mime) ->
+            Text("Res: ${w}x${h}")
+            Text("Format: ${mime.substringAfterLast('/')}")
+        }
+        ratio?.let {
+            Text("Ratio: %.2f".format(it))
+        }
+    }
+}
+
+
