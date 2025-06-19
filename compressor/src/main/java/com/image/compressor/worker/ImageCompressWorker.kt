@@ -7,18 +7,24 @@ import android.graphics.Matrix
 import android.net.Uri
 import android.os.Build
 import android.util.Log
+import androidx.core.net.toUri
 import androidx.exifinterface.media.ExifInterface
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.image.compressor.utils.getFileSizeKB
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sqrt
-import androidx.core.net.toUri
-import com.image.compressor.utils.getFileSizeKB
-import kotlinx.coroutines.yield
+import kotlin.system.measureTimeMillis
 
 class ImageCompressWorker(
     context: Context,
@@ -27,6 +33,11 @@ class ImageCompressWorker(
 
     private val TAG = "ImageCompressWorker"
     private val appContext = context
+    // Create a custom dispatcher with limited concurrency to avoid overwhelming the system
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val imageProcessingDispatcher = Dispatchers.IO.limitedParallelism(
+        parallelism = minOf(Runtime.getRuntime().availableProcessors(), 4)
+    )
 
     override suspend fun doWork(): Result {
         return try {
@@ -72,120 +83,80 @@ class ImageCompressWorker(
         }
     }
 
-    private suspend fun processMultipleImages(uriList: List<String>): Result {
-        val enableLogging = inputData.getBoolean("enableLogging", false)
-        val totalImages = uriList.size
 
-        if (enableLogging) Log.d(TAG, "Processing $totalImages images")
+    private suspend fun processMultipleImages(uriList: List<String>): Result =
+        coroutineScope {
+            val enableLogging = inputData.getBoolean("enableLogging", false)
+            val totalImages = uriList.size
 
-        val results = mutableListOf<WorkerCompressionResult>()
-        val compressedPaths = mutableListOf<String>()
-        var successCount = 0
-        var failedCount = 0
+            if (enableLogging) Log.d(TAG, "Processing $totalImages images in parallel")
 
-        setProgress(workDataOf(
-            "progress" to 0,
-            "currentImage" to 0,
-            "totalImages" to totalImages,
-            "status" to "Starting batch compression..."
-        ))
+            val results = Collections.synchronizedList(mutableListOf<WorkerCompressionResult>())
+            val compressedPaths = Collections.synchronizedList(mutableListOf<String>())
+            val processedCount = AtomicInteger(0)
+            val successCount = AtomicInteger(0)
+            val failedCount = AtomicInteger(0)
 
-        uriList.forEachIndexed { index, uriString ->
-            try {
-                val uri = uriString.toUri()
-                val currentImageProgress = ((index.toFloat() / totalImages) * 100).toInt()
-
-                setProgress(workDataOf(
-                    "progress" to currentImageProgress,
-                    "currentImage" to index + 1,
+            setProgress(
+                workDataOf(
+                    "progress" to 0,
+                    "currentImage" to 0,
                     "totalImages" to totalImages,
-                    "status" to "Processing image ${index + 1} of $totalImages..."
-                ))
+                    "status" to "Starting parallel batch compression..."
+                )
+            )
 
-                if (enableLogging) Log.d(TAG, "Processing image ${index + 1}/$totalImages: $uri")
+            try {
+                // Process images in parallel using async
+                val timeTakenMillis = measureTimeMillis {
+                    val deferredResults = uriList.mapIndexed { index, uriString ->
+                        async(imageProcessingDispatcher) {
+                            processImageAsync(
+                                index, uriString, totalImages, enableLogging,
+                                processedCount, successCount, failedCount, results, compressedPaths
+                            )
+                        }
+                    }
 
-                // Get original file size
-                val originalSizeKB = getFileSizeKB(appContext,uri)
-
-                // Compress the image
-                val compressionResult = compressImage(uri, index, totalImages)
-
-                if (compressionResult.success) {
-                    results.add(
-                        WorkerCompressionResult(
-                            index = index,
-                            originalUri = uriString,
-                            outputPath = compressionResult.outputPath,
-                            originalSizeKB = originalSizeKB,
-                            compressedSizeKB = compressionResult.compressedSizeKB,
-                            compressionRatio = calculateCompressionRatio(originalSizeKB, compressionResult.compressedSizeKB),
-                            success = true,
-                            error = null
-                        )
-                    )
-                    compressionResult.outputPath?.let { compressedPaths.add(it) }
-                    successCount++
-                } else {
-                    results.add(
-                        WorkerCompressionResult(
-                            index = index,
-                            originalUri = uriString,
-                            outputPath = null,
-                            originalSizeKB = originalSizeKB,
-                            compressedSizeKB = 0,
-                            compressionRatio = 0f,
-                            success = false,
-                            error = compressionResult.error
-                        )
-                    )
-                    failedCount++
-                    if (enableLogging) Log.e(TAG, "Failed to compress image ${index + 1}: ${compressionResult.error}")
+                    // Wait for all images to complete
+                    deferredResults.awaitAll()
                 }
-
-                // Yield to allow cancellation
-                yield()
+                if (enableLogging) Log.i(TAG, "Time taken in parallel processing: (${timeTakenMillis / 1000.0}s)")
 
             } catch (e: Exception) {
-                results.add(
-                    WorkerCompressionResult(
-                        index = index,
-                        originalUri = uriString,
-                        outputPath = null,
-                        originalSizeKB = 0,
-                        compressedSizeKB = 0,
-                        compressionRatio = 0f,
-                        success = false,
-                        error = e.message ?: "Unknown error"
-                    )
-                )
-                failedCount++
-                if (enableLogging) Log.e(TAG, "Exception processing image ${index + 1}: ${e.message}", e)
+                if (enableLogging) Log.e(TAG, "Error in parallel processing: ${e.message}", e)
+                return@coroutineScope Result.failure(workDataOf("error" to e.message))
             }
-        }
 
-        setProgress(workDataOf(
-            "progress" to 100,
-            "currentImage" to totalImages,
-            "totalImages" to totalImages,
-            "status" to "Batch compression completed: $successCount successful, $failedCount failed"
-        ))
-
-        if (enableLogging) {
-            Log.d(TAG, "Batch compression completed: $successCount successful, $failedCount failed")
-        }
-
-        val resultsJson = mapResultsToJson(results)
-
-        return Result.success(
-            workDataOf(
-                "compressedImagePaths" to compressedPaths.toTypedArray(),
-                "results" to resultsJson.toString(),
-                "successCount" to successCount,
-                "failedCount" to failedCount,
-                "totalProcessed" to totalImages
+            setProgress(
+                workDataOf(
+                    "progress" to 100,
+                    "currentImage" to totalImages,
+                    "totalImages" to totalImages,
+                    "status" to "Parallel compression completed: ${successCount.get()} successful, ${failedCount.get()} failed"
+                )
             )
-        )
-    }
+
+            if (enableLogging) {
+                Log.d(
+                    TAG,
+                    "Parallel compression completed: ${successCount.get()} successful, ${failedCount.get()} failed"
+                )
+            }
+
+            val sortedResults = results.sortedBy { it.index }
+            val resultsJson = mapResultsToJson(sortedResults)
+
+            return@coroutineScope Result.success(
+                workDataOf(
+                    "compressedImagePaths" to compressedPaths.toTypedArray(),
+                    "results" to resultsJson.toString(),
+                    "successCount" to successCount.get(),
+                    "failedCount" to failedCount.get(),
+                    "totalProcessed" to totalImages
+                )
+            )
+        }
 
     // Convert results to JSON string for output
     private fun mapResultsToJson(results: List<WorkerCompressionResult>): List<Map<String, Any?>> {
@@ -464,6 +435,89 @@ class ImageCompressWorker(
                     "jpg" // fallback
                 }
             }
+        }
+    }
+
+    private suspend fun processImageAsync(
+        index: Int,
+        uriString: String,
+        totalImages: Int,
+        enableLogging: Boolean,
+        processedCount: AtomicInteger,
+        successCount: AtomicInteger,
+        failedCount: AtomicInteger,
+        results: MutableList<WorkerCompressionResult>,
+        compressedPaths: MutableList<String>
+    ) {
+        try {
+            val uri = uriString.toUri()
+
+            if (enableLogging) Log.d(TAG, "Processing image ${index + 1}/$totalImages: $uri")
+
+            // Get original file size
+            val originalSizeKB = getFileSizeKB(appContext, uri)
+
+            // Compress the image
+            val compressionResult = compressImage(uri, index, totalImages)
+
+            val processed = processedCount.incrementAndGet()
+            val currentProgress = ((processed.toFloat() / totalImages) * 100).toInt()
+
+            // Update progress safely
+            setProgress(workDataOf(
+                "progress" to currentProgress,
+                "currentImage" to processed,
+                "totalImages" to totalImages,
+                "status" to "Processed $processed of $totalImages images..."
+            ))
+
+            if (compressionResult.success) {
+                results.add(
+                    WorkerCompressionResult(
+                        index = index,
+                        originalUri = uriString,
+                        outputPath = compressionResult.outputPath,
+                        originalSizeKB = originalSizeKB,
+                        compressedSizeKB = compressionResult.compressedSizeKB,
+                        compressionRatio = calculateCompressionRatio(originalSizeKB, compressionResult.compressedSizeKB),
+                        success = true,
+                        error = null
+                    )
+                )
+                compressionResult.outputPath?.let { compressedPaths.add(it) }
+                successCount.incrementAndGet()
+            } else {
+                results.add(
+                    WorkerCompressionResult(
+                        index = index,
+                        originalUri = uriString,
+                        outputPath = null,
+                        originalSizeKB = originalSizeKB,
+                        compressedSizeKB = 0,
+                        compressionRatio = 0f,
+                        success = false,
+                        error = compressionResult.error
+                    )
+                )
+                failedCount.incrementAndGet()
+                if (enableLogging) Log.e(TAG, "Failed to compress image ${index + 1}: ${compressionResult.error}")
+            }
+
+        } catch (e: Exception) {
+            results.add(
+                WorkerCompressionResult(
+                    index = index,
+                    originalUri = uriString,
+                    outputPath = null,
+                    originalSizeKB = 0,
+                    compressedSizeKB = 0,
+                    compressionRatio = 0f,
+                    success = false,
+                    error = e.message ?: "Unknown error"
+                )
+            )
+            failedCount.incrementAndGet()
+            if (enableLogging) Log.e(TAG, "Exception processing image ${index + 1}: ${e.message}", e)
         }
     }
 
